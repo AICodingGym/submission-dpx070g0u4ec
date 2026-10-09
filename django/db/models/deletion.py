@@ -60,6 +60,27 @@ def get_candidate_relations_to_delete(opts):
     )
 
 
+def get_deferrable_fields(opts):
+    """
+    Return the names of the local fields of the model described by 'opts' that
+    collecting its instances for deletion doesn't use: all but its primary
+    key, its parent links, and the fields referenced by relations pointing to
+    it. Fields inherited from concrete parents must not be deferred as parent
+    instances are built from them (see ForwardOneToOneDescriptor.get_object()).
+    """
+    required_fields = {
+        target_field.attname
+        for related in get_candidate_relations_to_delete(opts)
+        for target_field in related.field.foreign_related_fields
+    }
+    required_fields.update(ptr.attname for ptr in opts.parents.values() if ptr)
+    required_fields.add(opts.pk.attname)
+    return [
+        field.attname for field in opts.local_concrete_fields
+        if field.attname not in required_fields
+    ]
+
+
 class Collector:
     def __init__(self, using):
         self.using = using
@@ -116,6 +137,12 @@ class Collector:
             model, {}).setdefault(
             (field, value), set()).update(objs)
 
+    def _has_signal_listeners(self, model):
+        return (
+            signals.pre_delete.has_listeners(model) or
+            signals.post_delete.has_listeners(model)
+        )
+
     def can_fast_delete(self, objs, from_field=None):
         """
         Determine if the objects in the given queryset-like or single object
@@ -135,9 +162,7 @@ class Collector:
             model = objs.model
         else:
             return False
-        if (signals.pre_delete.has_listeners(model) or
-                signals.post_delete.has_listeners(model) or
-                signals.m2m_changed.has_listeners(model)):
+        if self._has_signal_listeners(model) or signals.m2m_changed.has_listeners(model):
             return False
         # The use of from_field comes from the need to avoid cascade back to
         # parent when parent delete is cascading to child.
@@ -220,8 +245,22 @@ class Collector:
                     sub_objs = self.related_objects(related, batch)
                     if self.can_fast_delete(sub_objs, from_field=field):
                         self.fast_deletes.append(sub_objs)
-                    elif sub_objs:
-                        field.remote_field.on_delete(self, field, sub_objs, self.using)
+                    else:
+                        related_model = related.related_model
+                        # Defer the fields that aren't needed to collect the
+                        # related objects unless deletion signal receivers,
+                        # which could access any field, are connected for the
+                        # related model. Skip it when some relationships are
+                        # select_related() (only possible if related_objects()
+                        # is overridden) as a deferred field can't be
+                        # traversed using select_related().
+                        if not (sub_objs.query.select_related or
+                                self._has_signal_listeners(related_model)):
+                            deferrable_fields = get_deferrable_fields(related_model._meta)
+                            if deferrable_fields:
+                                sub_objs = sub_objs.defer(*deferrable_fields)
+                        if sub_objs:
+                            field.remote_field.on_delete(self, field, sub_objs, self.using)
             for field in model._meta.private_fields:
                 if hasattr(field, 'bulk_related_objects'):
                     # It's something like generic foreign key.
